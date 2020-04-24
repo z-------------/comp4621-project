@@ -17,133 +17,103 @@ ENDLB = bytes(ENDL, ENC)
 TERM = "\r\n\r\n"
 TERMB = bytes(TERM, ENC)
 
+def sock_recv(sock, size):
+    '''Wrap the call to recv in a try...except'''
+    try:
+        return sock.recv(size)
+    except ConnectionAbortedError:
+        return b""
+
+def sock_close(*socks):
+    for sock in socks:
+        sock.close()
+
 def process_request(client_sock):
-    eprint("\nNEW INCOMING CONNECTION:", client_sock)
+    recvbuf = b""
+
+    # read one byte at a time until we have the whole header
+    while not recvbuf.endswith(TERMB):
+        recvbuf += sock_recv(client_sock, 1)
     
-    dest_sock = None
-    dest_connected = False
-    tunnel = False
+    # connect to destination
+    request, headers = HTTPHeader.parse(recvbuf.decode(ENC))
+    is_tunnel = request["method"] == "CONNECT"
+    try:
+        dest_ip = gethostbyname(request["hostname"])
+    except: # name resolution failed
+        client_sock.send(
+            bytes(
+                request["version"] + " 404 Not Found" + ENDL
+                + "Connection: close" + ENDL
+                + "Content-Length: 0" + ENDL
+                + ENDL,
+                ENC
+                )
+            )
+        return sock_close(client_sock)
+    dest_port = PORT_HTTPS if is_tunnel else PORT_HTTP
+    dest_sock = socket(AF_INET, SOCK_STREAM)
+    dest_sock.connect((dest_ip, dest_port))
+    if is_tunnel:
+        client_sock.send(bytes(request["version"] + " 200 Connection Established", ENC) + TERMB)
+    
+    # start process to relay data from destination to client
+    Process(target=forward_responses, args=(dest_sock, client_sock)).start()
 
-    buffer = b""
-
-    while True:
-        eprint("LOOP TOP")
-
-        if len(buffer) == 0:
-            eprint("WAITING FOR DATA FROM CLIENT")
-            try:
-                buffer += client_sock.recv(4096)
-            except:
-                eprint("FAILED: client_sock.recv")
-                break
-        if not len(buffer): # recv returns empty string if connection closed
-            break
-
-        eprint("RECEIVED DATA FROM CLIENT")
-        eprint("CURRENT BUFFER:", buffer)
-            
-        if not tunnel: # http
-            while (buffer.find(TERMB) == -1): # wait for whole http header
-                buffer += client_sock.recv(4096)
-
-            data_split = buffer.split(TERMB, 1)
-            # eprint(data_split)
-
-            buffer = b"" # clear buffer for next round
-
-            # header
-            header_data = data_split[0]
-            rest_data = data_split[1]
-            header_str = header_data.decode(ENC)
-            resource, headers = HTTPHeader.parse(header_str)
-            eprint("RESOURCE:", resource)
-            eprint("HEADERS:", headers)
-
-            # body
-            body_length = int(headers.get("Content-Length", 0))
-            body_left = body_length - len(rest_data)
-            if body_left < 0: # `rest_data` contains part of the next request
-                eprint("ROUTE ONE")
-                body_data = rest_data[:body_left]
-                buffer = rest_data[body_left:]
-            elif body_left > 0:
-                eprint("ROUTE TWO")
-                body_data = b""
-                while (body_left > 0):
-                    d = client_sock.recv(4096)
-                    body_data += d
-                    body_left -= len(d)
-                if body_left < 0:
-                    eprint("ROUTE THREE")
-                    body_data = body_data[:body_left]
-                    buffer = body_data[body_left:]
-            else:
-                body_data = rest_data
-        
-            eprint("BODY DATA:", body_data)
-
-            # eprint("CONVERTED HEADER:", bytes(HTTPHeader.generate(resource, headers), ENC))
-
-            is_connect = resource["method"] == "CONNECT"
-
-            if not dest_connected:
-                dest_port = PORT_HTTPS if is_connect else PORT_HTTP
-                try:
-                    dest_ip = gethostbyname(resource["hostname"])
-                except: # name resolution failed
-                    response = bytes(
-                        resource["version"] + " 404 Not Found" + ENDL
-                        + "Connection: close" + ENDL
-                        + "Content-Length: 0" + ENDL
-                        + ENDL,
-                        ENC
-                        )
-                    eprint("NAME RES FAILED; SENDING 404")
-                    client_sock.send(response)
-                    break
-                dest_sock = socket(AF_INET, SOCK_STREAM)
-                dest_sock.connect((dest_ip, dest_port))
-                dest_connected = True
-                if is_connect:
-                    tunn_response = bytes(resource["version"] + " 200 Connection Established", ENC) + TERMB
-                    eprint("SENDING 200 CONNECTION ESTABLISHED:", tunn_response)
-                    client_sock.send(tunn_response)
-                    tunnel = True
-                p = Process(target=forward_responses, args=(dest_sock, client_sock))
-                p.start()
-            if not is_connect:
-                dest_sock.send(bytes(HTTPHeader.generate(resource, headers), ENC) + TERMB)
-            if len(body_data):
-                dest_sock.send(body_data)
-        else: # https through tunnel
-            try:
-                dest_sock.send(buffer)
-                buffer = b"" # clear buffer for next round
-            except:
-                eprint("FAILED: dest_sock.send")
-                break
-
-        eprint("LOOP BOTTOM")
-
-    eprint("CLOSING CLIENT CONNECTION: ", client_sock)
-    client_sock.close()
-    if dest_sock.fileno() != -1:
-        dest_sock.close()
-    eprint("FILENO OF CLOSED CONNECTION:", client_sock.fileno())
+    if is_tunnel:
+        eprint("TUNNEL MODE")
+        recvbuf = b""
+        while True:
+            recvbuf = sock_recv(client_sock, 4096)
+            if not len(recvbuf):
+                return sock_close(client_sock, dest_sock)
+            size = len(recvbuf)
+            sent = 0
+            while sent < size:
+                sent += dest_sock.send(recvbuf[sent:])
+    else:
+        eprint("HTTP MODE")
+        is_header = True
+        body_left = 0
+        while True:
+            # eprint("LOOP TOP")
+            if is_header and recvbuf.endswith(TERMB):
+                # eprint("GOT HEADER")
+                is_header = False
+                request, headers = HTTPHeader.parse(recvbuf.decode(ENC))
+                # eprint("HEADERS:", headers)
+                header_b = bytes(HTTPHeader.generate(request, headers), ENC) + TERMB
+                # eprint("CONVERTED HEADERS:", header_b)
+                dest_sock.send(header_b)
+                # eprint("SENT HEADERS TO DEST")
+                body_left = int(headers.get("Content-Length", 0))
+                recvbuf = b""
+            elif not is_header:
+                # eprint("ECHO:", recvbuf)
+                dest_sock.send(recvbuf)
+                body_left -= 1
+                recvbuf = b""
+                if body_left == 0:
+                    is_header = True
+            recvbuf += sock_recv(client_sock, 1)
+            if not len(recvbuf):
+                return sock_close(client_sock, dest_sock)
+            # print("RECEIVE:", recvbuf)
+            # eprint("LOOP BOTTOM")
 
 def forward_responses(dest_sock, client_sock):
-    eprint("SPAWNED forward_responses:", dest_sock, client_sock)
+    # eprint("SPAWNED forward_responses:", dest_sock, client_sock)
     while True:
         try:
-            dest_d = dest_sock.recv(4096)
+            dest_d = sock_recv(dest_sock, 4096)
         except:
-            eprint("FAILED: dest_sock.recv")
+            eprint("DESTINATION SOCKED DIED")
             break
         if dest_d == b"":
             break
-        eprint(f"READ FROM {dest_sock.getpeername()}:", dest_d)
+        # eprint(f"READ FROM {dest_sock.getpeername()}:", dest_d)
         client_sock.send(dest_d)
-        eprint("FORWARDED TO CLIENT")
+        # eprint("FORWARDED TO CLIENT")
 
 if __name__ == "__main__":
     serv_sock = socket(AF_INET, SOCK_STREAM)
