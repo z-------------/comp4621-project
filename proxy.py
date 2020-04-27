@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
+import json
+
 from multiprocessing import Process
 from socket import *
+from http import HTTPStatus
 
 from util import *
-
-PORT = 8081
 
 PORT_HTTP = 80
 PORT_HTTPS = 443
@@ -22,22 +23,41 @@ def sock_recv(sock, size):
     try:
         return sock.recv(size)
     except ConnectionAbortedError:
-        return b""
+        return b""  # treat same as connection closed
 
 def sock_close(*socks):
     for sock in socks:
         sock.close()
 
-def process_request(client_sock):
+def process_request(client_sock, cfg):
     recvbuf = b""
 
     # read one byte at a time until we have the whole header
     while not recvbuf.endswith(TERMB):
         recvbuf += sock_recv(client_sock, 1)
-    
+
     # connect to destination
+
     request, headers = HTTPHeader.parse(recvbuf.decode(ENC))
     is_tunnel = request["method"] == "CONNECT"
+
+    # refuse if hostname blocked by access control
+    if request["hostname"] in cfg["access_control"]["domains"]:
+        eprint("ACCESS CONTROL: Blocked attempt to access {}".format(request["hostname"]))
+        status_code = cfg["access_control"]["status"]
+        status_message = HTTPStatus(status_code).phrase
+        client_sock.send(
+            bytes(
+                request["version"] + f" {status_code} {status_message}" + ENDL
+                + "Connection: close" + ENDL
+                + "Content-Length: 0" + ENDL
+                + ENDL,
+                ENC
+                )
+            )
+        return sock_close(client_sock)
+
+    # resolve address
     try:
         dest_ip = gethostbyname(request["hostname"])
     except: # name resolution failed
@@ -51,17 +71,19 @@ def process_request(client_sock):
                 )
             )
         return sock_close(client_sock)
+
+    # connect
     dest_port = PORT_HTTPS if is_tunnel else PORT_HTTP
     dest_sock = socket(AF_INET, SOCK_STREAM)
     dest_sock.connect((dest_ip, dest_port))
     if is_tunnel:
         client_sock.send(bytes(request["version"] + " 200 Connection Established", ENC) + TERMB)
-    
+
     # start process to relay data from destination to client
     Process(target=forward_responses, args=(dest_sock, client_sock)).start()
 
     if is_tunnel:
-        eprint("TUNNEL MODE")
+        # eprint("TUNNEL MODE")
         recvbuf = b""
         while True:
             recvbuf = sock_recv(client_sock, 4096)
@@ -72,7 +94,7 @@ def process_request(client_sock):
             while sent < size:
                 sent += dest_sock.send(recvbuf[sent:])
     else:
-        eprint("HTTP MODE")
+        # eprint("HTTP MODE")
         is_header = True
         body_left = 0
         while True:
@@ -116,13 +138,24 @@ def forward_responses(dest_sock, client_sock):
         # eprint("FORWARDED TO CLIENT")
 
 if __name__ == "__main__":
+    # load config
+    try:
+        with open("config.json", "r") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        eprint("config.json not found. Please create it and enter the configuation settings.")
+        sys.exit(1)
+
+    # set up server
+    serv_addr, serv_port = cfg["server"]["address"], cfg["server"]["port"]
     serv_sock = socket(AF_INET, SOCK_STREAM)
-    serv_sock.bind(("0.0.0.0", PORT))
+    serv_sock.bind((serv_addr, serv_port))
     serv_sock.listen()
 
-    eprint(f"Listening on :{PORT}")
+    eprint(f"Listening at {serv_addr}:{serv_port}")
 
+    # handle requests
     while True:
         client_sock, client_addr = serv_sock.accept()
-        p = Process(target=process_request, args=(client_sock, ))
+        p = Process(target=process_request, args=(client_sock, cfg))
         p.start()
