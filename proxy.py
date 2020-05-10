@@ -7,6 +7,7 @@ from socket import *
 from http import HTTPStatus
 
 from util import *
+import cache
 
 PORT_HTTP = 80
 PORT_HTTPS = 443
@@ -17,6 +18,23 @@ ENDL = "\r\n"
 ENDLB = bytes(ENDL, ENC)
 TERM = "\r\n\r\n"
 TERMB = bytes(TERM, ENC)
+
+def get_parts(data: bytes):
+    if TERMB not in data:
+        return None
+    return data.split(TERMB)
+
+def get_headers(data: bytes):
+    parts = get_parts(data)
+    if parts is None:
+        return None
+    return HTTPHeader.parse(parts[0])
+
+def get_body(data: bytes):
+    parts = get_parts(data)
+    if parts is None:
+        return None
+    return parts[1]
 
 def sock_recv(sock, size):
     '''Wrap the call to recv in a try...except'''
@@ -98,20 +116,14 @@ def process_request(client_sock, cfg):
         is_header = True
         body_left = 0
         while True:
-            # eprint("LOOP TOP")
-            if is_header and recvbuf.endswith(TERMB):
-                # eprint("GOT HEADER")
+            if is_header and recvbuf.endswith(TERMB):  # done collecting headers
                 is_header = False
                 request, headers = HTTPHeader.parse(recvbuf.decode(ENC))
-                # eprint("HEADERS:", headers)
                 header_b = bytes(HTTPHeader.generate(request, headers), ENC) + TERMB
-                # eprint("CONVERTED HEADERS:", header_b)
                 dest_sock.send(header_b)
-                # eprint("SENT HEADERS TO DEST")
                 body_left = int(headers.get("Content-Length", 0))
                 recvbuf = b""
-            elif not is_header:
-                # eprint("ECHO:", recvbuf)
+            elif not is_header:  # receiving body
                 dest_sock.send(recvbuf)
                 body_left -= 1
                 recvbuf = b""
@@ -120,8 +132,6 @@ def process_request(client_sock, cfg):
             recvbuf += sock_recv(client_sock, 1)
             if not len(recvbuf):
                 return sock_close(client_sock, dest_sock)
-            # print("RECEIVE:", recvbuf)
-            # eprint("LOOP BOTTOM")
 
 def forward_responses(dest_sock, client_sock):
     # eprint("SPAWNED forward_responses:", dest_sock, client_sock)
