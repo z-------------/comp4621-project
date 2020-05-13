@@ -6,7 +6,8 @@
     "access_control": {
         "status": 404,
         "domains": [
-            "sing.cse.ust.hk"
+            "sing.cse.ust.hk",
+            "google.com"
         ]
     }
 }
