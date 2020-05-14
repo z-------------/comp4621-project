@@ -21,33 +21,15 @@ TERMB = bytes(TERM, ENC)
 
 RECV_SIZE = 4096
 
-def get_parts(data: bytes):
-    if TERMB not in data:
-        return None
-    return data.split(TERMB)
+CACHEABLE_METHODS = ["GET", "HEAD"]
 
-def get_headers(data: bytes):
-    parts = get_parts(data)
-    if parts is None:
-        return None
-    return HTTPHeader.parse(parts[0])
-
-def get_body(data: bytes):
-    parts = get_parts(data)
-    if parts is None:
-        return None
-    return parts[1]
-
-def get_status_message(code: int):
-    return str(code) + " " + HTTPStatus(code).phrase
-
-def is_cacheable(method: str, response: dict, headers: dict):
+def is_cacheable(method: str, response: dict):
     """
     Returns True if the resource is cacheable; False otherwise.
     """
     # https://developer.mozilla.org/en-US/docs/Glossary/cacheable
     return \
-        method in ["GET", "HEAD"] \
+        method in CACHEABLE_METHODS \
         and response["status"]["code"] in [200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501]
 
 def sock_recv(sock, size):
@@ -80,7 +62,7 @@ def process_request(client_sock, cfg):
         status_message = get_status_message(cfg["access_control"]["status"])
         client_sock.send(
             bytes(
-                request["version"] + f" {status_message}" + ENDL
+                request["version"] + " " + status_message + ENDL
                 + "Connection: close" + ENDL
                 + f"Content-Length: {len(status_message)}" + ENDL
                 + ENDL
@@ -97,7 +79,7 @@ def process_request(client_sock, cfg):
         status_message = get_status_message(404)
         client_sock.send(
             bytes(
-                request["version"] + f" {status_message}" + ENDL
+                request["version"] + " " + status_message + ENDL
                 + "Connection: close" + ENDL
                 + f"Content-Length: {len(status_message)}" + ENDL
                 + ENDL
@@ -114,9 +96,6 @@ def process_request(client_sock, cfg):
     if is_tunnel:
         client_sock.send(bytes(request["version"] + " 200 Connection Established", ENC) + TERMB)
 
-    # start process to relay data from destination to client
-    # Process(target=forward_responses, args=(dest_sock, request["hostname"], client_sock, is_tunnel)).start()
-
     if is_tunnel:
         # eprint("TUNNEL MODE")
         recvbuf = b""
@@ -128,7 +107,7 @@ def process_request(client_sock, cfg):
             sent = 0
             while sent < size:
                 sent += dest_sock.send(recvbuf[sent:])
-        # O tunnel mode, thine simplicity bewilst me unto joy
+        # o tunnel mode, thine simplicity bewilst me unto joy
     else:
         # eprint("HTTP MODE")
         is_header = True
@@ -140,9 +119,11 @@ def process_request(client_sock, cfg):
         resource_hostname = None
         resource_path = None  # keep track of the URL for cacheing
         cache_file = None
+        is_cache_validate = False
 
         while True:
             if not wait_for_dest:
+                is_cache_validate = False
                 if cache_file is not None:
                     eprint(f"Closing cache file '{cache_file.name}'...")
                     cache_file.close()
@@ -155,6 +136,21 @@ def process_request(client_sock, cfg):
                     resource_hostname = request["hostname"]
                     resource_path = request["path"]
                     resource_method = request["method"]
+
+                    # check if we have the requested resource in cache
+                    request_is_conditional = bool(
+                        dict_get_insensitive(headers, "If-Modified-Since")
+                        or dict_get_insensitive(headers, "ETag")
+                        )
+                    # leave the request alone if client is already doing conditional
+                    if resource_method in CACHEABLE_METHODS and not request_is_conditional:
+                        resource_url = "http://" + resource_hostname + resource_path
+                        cache_metadata = cache.get_metadata(resource_url)  # None or (<last modified>, <etag>)
+                        if cache_metadata is not None and cache_metadata[0] is not None:
+                            is_cache_validate = True
+                            headers["If-Modified-Since"] = cache_metadata[0]
+                            # modifies the client's request into a conditional
+                            # based on our cached metadata
 
                     header_b = bytes(HTTPHeader.generate(request, headers), ENC) + TERMB
                     dest_sock.send(header_b)  # forward to dest
@@ -175,7 +171,6 @@ def process_request(client_sock, cfg):
                     recvbuf += sock_recv(client_sock, 1)
                     if not recvbuf:
                         return sock_close(client_sock, dest_sock)
-                # TODO conditionally fulfil requests using cache
             else:  # wait_for_dest == True
                 # eprint("dest's turn")
                 dest_d = sock_recv(dest_sock, 1)
@@ -185,11 +180,25 @@ def process_request(client_sock, cfg):
                 if is_header and recvbuf.endswith(TERMB):  # done collecting headers
                     response, headers = HTTPHeader.parse(recvbuf.decode(ENC), is_response=True)
                     eprint(response)
+                    resource_url = "http://" + resource_hostname + resource_path
+
                     if is_cacheable(resource_method, response, headers):
-                        resource_url = "http://" + resource_hostname + resource_path
                         cache.create_entry(resource_url)
                         cache_file = cache.open_file(resource_url, "wb")
                         cache_file.write(recvbuf)
+
+                    if is_cache_validate and response["status"]["code"] == 304:  # Not Modified
+                        # just send client what we have in cache and go back to client's turn
+                        # note that this block is mutually exclusive with the
+                        # above block, since 304 is not cacheable
+                        with cache.open_file(resource_url, "rb") as f:
+                            cbd = f.read(48)  # arbitrary size
+                            while cbd:
+                                client_sock.send(cbd)
+                                cbd = f.read(48)
+                        wait_for_dest = False
+                    # else, echo back to client and save to cache as usual...
+
                     body_left = int(headers.get("Content-Length", 0))
                     if body_left > 0:
                         is_header = False
@@ -216,8 +225,7 @@ if __name__ == "__main__":
         with open("config.json", "r") as f:
             cfg = json.load(f)
     except FileNotFoundError:
-        eprint("config.json not found. Please create it and enter the configuation settings.")
-        sys.exit(1)
+        die("config.json not found. Please create it and enter the configuation settings.")
 
     # create cache directory
     cache.createdir()

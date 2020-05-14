@@ -70,3 +70,29 @@ class HTTPHeader:
         for key in headers:
             lines.append(f"{key}: {headers[key]}")
         return "\r\n".join(lines)
+
+def get_parts(data: bytes):
+    if TERMB not in data:
+        return None
+    return data.split(TERMB)
+
+def get_headers(data: bytes):
+    parts = get_parts(data)
+    if parts is None:
+        return None
+    return HTTPHeader.parse(parts[0])
+
+def get_body(data: bytes):
+    parts = get_parts(data)
+    if parts is None:
+        return None
+    return parts[1]
+
+def get_status_message(code: int):
+    return str(code) + " " + HTTPStatus(code).phrase
+
+def dict_get_insensitive(d: dict, key, default=None):
+    for k in d:
+        if k.lower() == key.lower():
+            return d[k]
+    return default
