@@ -239,6 +239,8 @@ def process_request(client_sock, cfg):
                         responded_from_cache = True
                         wait_for_dest = False
                         is_cache_validate = False
+                    elif is_cache_validate:
+                        client_sock.send(recvbuf)
                     # else, echo back to client and save to cache as usual...
 
                     body_left = int(headers.get("Content-Length", 0))
