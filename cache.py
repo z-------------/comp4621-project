@@ -43,7 +43,10 @@ def create_entry(url):
     Returns `True` if the entry already exists, `False` otherwise.
     '''
     try:
-        os.makedirs(path.join(CACHE_DIR, *_getpath(url)), exist_ok=False)
+        dirpath = path.join(CACHE_DIR, *_getpath(url))
+        os.makedirs(dirpath, exist_ok=False)
+        with open(path.join(dirpath, "url.txt"), "w") as f:
+            f.write(url)
         return True
     except FileExistsError:
         return False

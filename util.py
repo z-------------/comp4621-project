@@ -1,6 +1,8 @@
 import re
 import sys
 
+from http import HTTPStatus
+
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 

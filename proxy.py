@@ -23,7 +23,7 @@ RECV_SIZE = 4096
 
 CACHEABLE_METHODS = ["GET", "HEAD"]
 
-def is_cacheable(method: str, response: dict):
+def is_cacheable(method: str, response: dict, headers: dict):
     """
     Returns True if the resource is cacheable; False otherwise.
     """
@@ -33,16 +33,32 @@ def is_cacheable(method: str, response: dict):
         and response["status"]["code"] in [200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501]
 
 def sock_recv(sock, size):
-    '''Wrap the call to recv in a try...except'''
-    try:
-        return sock.recv(size)
-    # except ConnectionAbortedError:
-    except:
-        return b""  # treat same as connection closed
+    return sock.recv(size)
+
+    # '''Wrap the call to recv in a try...except'''
+    # try:
+    #     return sock.recv(size)
+    # # except ConnectionAbortedError:
+    # except:
+    #     return b""  # treat same as connection closed
 
 def sock_close(*socks):
     for sock in socks:
         sock.close()
+
+def forward_responses(dest_sock, client_sock):
+    eprint("SPAWNED forward_responses:", dest_sock, client_sock)
+    while True:
+        try:
+            dest_d = sock_recv(dest_sock, 4096)
+        except:
+            # eprint("DESTINATION SOCKED DIED")
+            break
+        if dest_d == b"":
+            break
+        # eprint(f"READ FROM {dest_sock.getpeername()}:", dest_d)
+        client_sock.send(dest_d)
+        # eprint("FORWARDED TO CLIENT")
 
 def process_request(client_sock, cfg):
     recvbuf = b""
@@ -94,13 +110,21 @@ def process_request(client_sock, cfg):
     dest_sock = socket(AF_INET, SOCK_STREAM)
     dest_sock.connect((dest_ip, dest_port))
     if is_tunnel:
+        print(f"Tunnel: connection established with {dest_ip}:{dest_port}")
         client_sock.send(bytes(request["version"] + " 200 Connection Established", ENC) + TERMB)
 
     if is_tunnel:
-        # eprint("TUNNEL MODE")
+        eprint("TUNNEL MODE")
+
+        # start process to relay data from destination to client
+        Process(target=forward_responses, args=(dest_sock, client_sock)).start()
+
         recvbuf = b""
         while True:
+            # print("wait for client")
             recvbuf = sock_recv(client_sock, RECV_SIZE)
+            # print("recvbuf:", recvbuf)
+            # print("done waiting for client")
             if not len(recvbuf):
                 return sock_close(client_sock, dest_sock)
             size = len(recvbuf)
@@ -109,7 +133,7 @@ def process_request(client_sock, cfg):
                 sent += dest_sock.send(recvbuf[sent:])
         # o tunnel mode, thine simplicity bewilst me unto joy
     else:
-        # eprint("HTTP MODE")
+        eprint("HTTP MODE")
         is_header = True
         body_left = 0
         wait_for_dest = False  # True -> request complete, wait for response;
@@ -120,12 +144,14 @@ def process_request(client_sock, cfg):
         resource_path = None  # keep track of the URL for cacheing
         cache_file = None
         is_cache_validate = False
+        responded_from_cache = False
 
         while True:
             if not wait_for_dest:
                 is_cache_validate = False
+                responded_from_cache = False
                 if cache_file is not None:
-                    eprint(f"Closing cache file '{cache_file.name}'...")
+                    eprint(f"Closing (write) cache file '{cache_file.name}'...")
                     cache_file.close()
                     cache_file = None
                 # eprint("client's turn")
@@ -173,6 +199,7 @@ def process_request(client_sock, cfg):
                         return sock_close(client_sock, dest_sock)
             else:  # wait_for_dest == True
                 # eprint("dest's turn")
+
                 dest_d = sock_recv(dest_sock, 1)
                 if not dest_d:
                     return sock_close(client_sock, dest_sock)
@@ -185,18 +212,27 @@ def process_request(client_sock, cfg):
                     if is_cacheable(resource_method, response, headers):
                         cache.create_entry(resource_url)
                         cache_file = cache.open_file(resource_url, "wb")
-                        cache_file.write(recvbuf)
+
+                        # insert a custom x-header at the bottom
+                        mod_recvbuf = recvbuf[:-2] + b"X-zjguard-Cache: 1\r\n" + recvbuf[-2:]
+
+                        cache_file.write(mod_recvbuf[:-1])  # chop off the last byte ('\n'), otherwise
+                                                            # it will be double-written below
 
                     if is_cache_validate and response["status"]["code"] == 304:  # Not Modified
                         # just send client what we have in cache and go back to client's turn
                         # note that this block is mutually exclusive with the
                         # above block, since 304 is not cacheable
                         with cache.open_file(resource_url, "rb") as f:
+                            print(f"RESPONDING FROM CACHE: {f.name}")
                             cbd = f.read(48)  # arbitrary size
                             while cbd:
+                                # print("send from cache:", cbd)
                                 client_sock.send(cbd)
                                 cbd = f.read(48)
+                        responded_from_cache = True
                         wait_for_dest = False
+                        is_cache_validate = False
                     # else, echo back to client and save to cache as usual...
 
                     body_left = int(headers.get("Content-Length", 0))
@@ -212,7 +248,9 @@ def process_request(client_sock, cfg):
                         is_header = True
                         wait_for_dest = False
                 try:
-                    client_sock.send(dest_d)  # forward to client
+                    if not is_cache_validate and not responded_from_cache:
+                        # print("send from dest:", dest_d, "; responded_from_cache =", responded_from_cache)
+                        client_sock.send(dest_d)  # forward to client
                     if cache_file is not None:
                         cache_file.write(dest_d)  # write to cache file
                 except:
