@@ -57,8 +57,10 @@ def forward_responses(dest_sock, client_sock):
             dest_d = sock_recv(dest_sock, 4096)
         except:
             # eprint("DESTINATION SOCKED DIED")
+            sock_close(client_sock)
             break
         if dest_d == b"":
+            sock_close(client_sock, dest_sock)
             break
         # eprint(f"READ FROM {dest_sock.getpeername()}:", dest_d)
         client_sock.send(dest_d)
