@@ -28,9 +28,13 @@ def is_cacheable(method: str, response: dict, headers: dict):
     Returns True if the resource is cacheable; False otherwise.
     """
     # https://developer.mozilla.org/en-US/docs/Glossary/cacheable
+    h_cachecontrol = dict_get_insensitive(headers, "Cache-Control")
+    h_authorization = dict_get_insensitive(headers, "Authorization")
     return \
         method in CACHEABLE_METHODS \
-        and response["status"]["code"] in [200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501]
+        and response["status"]["code"] in [200, 203, 204, 206, 300, 301, 404, 405, 410, 414, 501] \
+        and h_cachecontrol is None or h_cachecontrol.lower() != "private" \
+        and h_authorization is None
 
 def sock_recv(sock, size):
     return sock.recv(size)
